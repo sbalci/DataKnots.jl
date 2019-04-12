@@ -12,8 +12,8 @@ using DataKnots
 using Literate
 
 # Convert Literate example code to markdown.
-INPUTS = joinpath(@__DIR__, "src", "simulation.jl")
-OUTPUT = joinpath(@__DIR__, "src")
+INPUTS = joinpath(@__DIR__, "src", "showcase", "simulation.jl")
+OUTPUT = joinpath(@__DIR__, "src", "showcase")
 Literate.markdown(INPUTS, OUTPUT, documenter=true, credit=false)
 
 # Highlight indented code blocks as Julia code.
@@ -38,7 +38,7 @@ makedocs(
             "queries.md",
         ],
         "Showcase" => [
-            "simulation.md",
+            joinpath("showcase", "simulation.md"),
         ],
     ],
     modules = [DataKnots])
