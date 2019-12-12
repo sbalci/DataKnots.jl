@@ -237,6 +237,17 @@ end
 
 
 #
+# Representation.
+#
+
+quoteof(p::Union{PipelineNode, PipelineChain}) =
+    quoteof(convert(Pipeline, p))
+
+show(io::IO, p::Union{PipelineNode, PipelineChain}) =
+    print_expr(io, quoteof(p))
+
+
+#
 # Multi-pass pipeline optimizer.
 #
 
@@ -250,6 +261,7 @@ end
 
 function rewrite_all!(c::PipelineChain, sig::Signature)
     rewrite_simplify!(c)
+    rewrite_dead!(c)
 end
 
 function rewrite_with!(f!, p::PipelineNode)
@@ -398,5 +410,218 @@ function simplify!(p::PipelineNode)
             delete!(p)
         end
     end
+end
+
+
+#
+# Dead wire elimination.
+#
+
+function rewrite_dead!(c::PipelineChain)
+    v = Dict{PipelineNode,Signature}()
+    visibility!(v, c, AnyShape())
+    for (p, sig) in v
+        if target(sig) isa NoShape
+            c = p.up
+            delete!(p)
+            while c !== nothing && isempty(c) && c.up !== nothing && (c.up.op === with_elements || c.up.op == with_column)
+                p = c.up
+                c = p.up
+                delete!(p)
+            end
+        end
+    end
+end
+
+function visibility!(v::Dict{PipelineNode,Signature}, c::PipelineChain, tgt::AbstractShape)
+    p = c.down_tail
+    while p !== nothing
+        src = visibility!(v, p, tgt)
+        v[p] = Signature(src, tgt)
+        tgt = src
+        p = p.left
+    end
+    tgt
+end
+
+function visibility!(v::Dict{PipelineNode,Signature}, p::PipelineNode, tgt::AbstractShape)
+    if tgt isa NoShape
+        src = tgt
+    elseif p.op === filler
+        src = NoShape()
+    elseif p.op === null_filler || p.op === block_filler
+        @assert tgt isa Union{BlockOf, AnyShape}
+        src = NoShape()
+    elseif p.op === tuple_of
+        @assert length(p.args) == 1 && p.args[1] isa Vector{Symbol}
+        @assert p.down_many !== nothing
+        @assert tgt isa Union{TupleOf, AnyShape}
+        lbls = p.args[1]
+        src = NoShape()
+        for (k, c) in enumerate(p.down_many)
+            if tgt isa TupleOf
+                tgt_lbls = labels(tgt)
+                tgt_cols = columns(tgt)
+                if !isempty(lbls)
+                    lbl = lbls[k]
+                    k = findfirst(isequal(lbl), tgt_lbls)
+                end
+                col_tgt = k !== nothing && 1 <= k <= length(tgt_cols) ? tgt_cols[k] : NoShape()
+            else
+                col_tgt = tgt
+            end
+            col_src = visibility!(v, c, col_tgt)
+            src = visibility_union(src, col_src)
+        end
+    elseif p.op === with_elements
+        @assert tgt isa Union{BlockOf, AnyShape}
+        @assert p.down !== nothing
+        elt_tgt = tgt isa BlockOf ? elements(tgt) : tgt
+        elt_src = visibility!(v, p.down, elt_tgt)
+        src = elt_src isa AnyShape ? elt_src : BlockOf(elt_src)
+    elseif p.op === with_column
+        @assert length(p.args) == 1 && p.args[1] isa Union{Symbol, Number}
+        @assert tgt isa Union{TupleOf, AnyShape}
+        @assert p.down !== nothing
+        lbl = p.args[1]
+        if tgt isa TupleOf
+            lbls = labels(tgt)
+            cols = columns(tgt)
+            k = lbl isa Symbol ? findfirst(isequal(lbl), lbls) :
+                1 <= lbl <= length(cols) ? lbl : nothing
+            col_tgt = k !== nothing ? cols[k] : NoShape()
+            col_src = visibility!(v, p.down, col_tgt)
+            if k !== nothing
+                cols = copy(cols)
+                cols[k] = col_src
+            end
+            src = TupleOf(lbls, cols)
+        else
+            src = tgt
+        end
+    elseif p.op === wrap
+        @assert tgt isa Union{BlockOf, AnyShape}
+        src = tgt isa BlockOf ? elements(tgt) : tgt
+    elseif p.op === flatten
+        @assert tgt isa Union{BlockOf, AnyShape}
+        src = tgt isa BlockOf ? BlockOf(tgt) : tgt
+    elseif p.op === distribute
+        @assert length(p.args) == 1 && p.args[1] isa Union{Symbol, Number}
+        @assert tgt isa Union{BlockOf, AnyShape}
+        if tgt isa BlockOf
+            lbl = p.args[1]
+            elt_tgt = elements(tgt)
+            @assert elt_tgt isa Union{TupleOf, NoShape, AnyShape}
+            if elt_tgt isa TupleOf
+                lbls = labels(elt_tgt)
+                cols = columns(elt_tgt)
+                k = lbl isa Symbol ? findfirst(isequal(lbl), lbls) :
+                    1 <= lbl <= length(cols) ? lbl : nothing
+                col_tgt = k !== nothing ? cols[k] : NoShape()
+                col_src = BlockOf(col_tgt)
+                if k !== nothing
+                    cols = copy(cols)
+                    cols[k] = col_src
+                elseif lbl isa Symbol
+                    k = searchsortedfirst(lbls, lbl)
+                    lbls = copy(lbls)
+                    insert!(lbls, k, lbl)
+                    cols = copy(cols)
+                    insert!(cols, k, col_src)
+                else
+                    cols = copy(cols)
+                    while length(cols) < lbl - 1
+                        push!(cols, NoShape())
+                    end
+                    push!(cols, col_src)
+                end
+                src = TupleOf(lbls, cols)
+            elseif elt_tgt isa NoShape
+                if lbl isa Symbol
+                    src = TupleOf(lbl => BlockOf(elt_tgt))
+                else
+                    cols = AbstractShape[]
+                    for k = 1:lbl-1
+                        push!(cols, NoShape())
+                    end
+                    push!(cols, tgt)
+                    src = TupleOf(cols)
+                end
+            else
+                src = elt_tgt
+            end
+        else
+            src = tgt
+        end
+    elseif p.op === column
+        @assert length(p.args) == 1 && p.args[1] isa Union{Symbol, Number}
+        lbl = p.args[1]
+        if lbl isa Symbol
+            src = TupleOf(lbl => tgt)
+        else
+            cols = AbstractShape[]
+            for k = 1:lbl-1
+                push!(cols, NoShape())
+            end
+            push!(cols, tgt)
+            src = TupleOf(cols)
+        end
+    elseif p.op === sieve_by
+        @assert tgt isa Union{BlockOf, AnyShape}
+        src = tgt isa BlockOf ? TupleOf(elements(tgt), AnyShape()) : tgt
+    elseif p.op === block_length
+        src = BlockOf(NoShape())
+    else
+        src = AnyShape()
+    end
+    src
+end
+
+function visibility_union(shp1::AbstractShape, shp2::AbstractShape)
+    @assert shp1 isa Union{NoShape, AnyShape} || shp2 isa Union{NoShape, AnyShape}
+    if shp1 isa AnyShape || shp2 isa NoShape
+        return shp1
+    elseif shp1 isa NoShape || shp2 isa AnyShape
+        return shp2
+    end
+end
+
+function visibility_union(shp1::BlockOf, shp2::BlockOf)
+    elt_shp = visibility_union(elements(shp1), elements(shp2))
+    elt_shp isa AnyShape ? elt_shp : BlockOf(elt_shp)
+end
+
+function visibility_union(shp1::TupleOf, shp2::TupleOf)
+    lbls1 = labels(shp1)
+    cols1 = columns(shp1)
+    lbls2 = labels(shp2)
+    cols2 = columns(shp2)
+    lbls = Symbol[]
+    cols = AbstractShape[]
+    k1 = k2 = 1
+    while k1 <= length(cols1) || k2 <= length(cols2)
+        if k1 <= length(lbls1) && k2 <= length(lbls2) && lbls1[k1] < lbls2[k2] || k2 > length(cols2)
+            if k1 <= length(lbls1)
+                push!(lbls, lbls1[k1])
+            end
+            push!(cols, cols1[k1])
+            k1 += 1
+        elseif k1 <= length(lbls1) && k2 <= length(lbls2) && lbls1[k1] > lbls2[k2] || k1 > length(cols1)
+            if k2 <= length(lbls2)
+                push!(lbls, lbls2[k2])
+            end
+            push!(cols, cols2[k2])
+            k2 += 1
+        else
+            col_shp = visibility_union(cols1[k1], cols2[k2])
+            if k1 <= length(lbls1) && k2 <= length(lbls2)
+                push!(lbls, lbls1[k1])
+            end
+            push!(cols, col_shp)
+            k1 += 1
+            k2 += 1
+        end
+    end
+    TupleOf(lbls, cols)
 end
 
